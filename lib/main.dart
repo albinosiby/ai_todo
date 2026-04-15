@@ -1,27 +1,36 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:provider/provider.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'package:firebase_core/firebase_core.dart';
-import 'package:flutter_gemma/core/api/flutter_gemma.dart';
-import 'core/theme/app_theme.dart';
-import 'core/theme/cubit/theme_cubit.dart';
-import 'ui/screens/splash_screen.dart';
-import 'firebase_options.dart';
-
-import 'data/repositories/auth_repository.dart';
-import 'data/repositories/goal_repository.dart';
-import 'logic/cubits/auth/auth_cubit.dart';
-import 'logic/cubits/goal/goal_cubit.dart';
-import 'logic/cubits/task/task_cubit.dart';
+import 'services/gemini_service.dart';
+import 'services/voice_service.dart';
+import 'services/notification_service.dart';
+import 'services/task_service.dart';
+import 'features/voice_coach/presentation/pages/voice_chat_page.dart';
+import 'features/tasks/presentation/pages/my_tasks_page.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp(
-    options: DefaultFirebaseOptions.currentPlatform,
+  await Firebase.initializeApp();
+  
+  // Initialize services
+  final voiceService = VoiceService();
+  await voiceService.init();
+  
+  final notificationService = NotificationService();
+  await notificationService.init();
+  
+  runApp(
+    MultiProvider(
+      providers: [
+        Provider<GeminiService>(create: (_) => GeminiService()),
+        Provider<VoiceService>(create: (_) => voiceService),
+        Provider<NotificationService>(create: (_) => notificationService),
+        Provider<TaskService>(create: (_) => TaskService()),
+      ],
+      child: const MyApp(),
+    ),
   );
-  FlutterGemma.initialize(
-    huggingFaceToken: const String.fromEnvironment('HUGGINGFACE_TOKEN'),
-  );
-  runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
@@ -29,38 +38,59 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MultiRepositoryProvider(
-      providers: [
-        RepositoryProvider(create: (_) => AuthRepository()),
-        RepositoryProvider(create: (_) => GoalRepository()),
-      ],
-      child: MultiBlocProvider(
-        providers: [
-          BlocProvider(create: (_) => ThemeCubit()),
-          BlocProvider(
-            create: (context) => AuthCubit(authRepository: context.read<AuthRepository>()),
-          ),
-          BlocProvider(
-            create: (context) => GoalCubit(goalRepository: context.read<GoalRepository>()),
-          ),
-          BlocProvider(
-            create: (context) => TaskCubit(goalRepository: context.read<GoalRepository>()),
-          ),
-        ],
-        child: BlocBuilder<ThemeCubit, ThemeState>(
-          builder: (context, state) {
-            return MaterialApp(
-              title: 'AI Productivity Coach',
-              theme: AppTheme.lightTheme,
-              darkTheme: AppTheme.darkTheme,
-              themeMode: state.themeMode,
-              home: const SplashScreen(),
-              debugShowCheckedModeBanner: false,
-            );
-          },
+    return MaterialApp(
+      title: 'AI Task Coach',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF6366F1),
+          brightness: Brightness.dark,
         ),
+        useMaterial3: true,
+        textTheme: GoogleFonts.outfitTextTheme(ThemeData.dark().textTheme),
       ),
+      home: const AppHomePage(),
     );
   }
 }
 
+class AppHomePage extends StatefulWidget {
+  const AppHomePage({super.key});
+
+  @override
+  State<AppHomePage> createState() => _AppHomePageState();
+}
+
+class _AppHomePageState extends State<AppHomePage> {
+  int _currentIndex = 0;
+
+  final List<Widget> _pages = const [
+    VoiceChatPage(),
+    MyTasksPage(),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: _pages[_currentIndex],
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _currentIndex,
+        onDestinationSelected: (index) {
+          setState(() => _currentIndex = index);
+        },
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.mic_none_rounded),
+            selectedIcon: Icon(Icons.mic_rounded),
+            label: 'Coach',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.checklist_rtl_outlined),
+            selectedIcon: Icon(Icons.checklist_rtl_rounded),
+            label: 'My Tasks',
+          ),
+        ],
+      ),
+    );
+  }
+}

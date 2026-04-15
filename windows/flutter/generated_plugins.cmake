@@ -7,12 +7,15 @@ list(APPEND FLUTTER_PLUGIN_LIST
   firebase_auth
   firebase_core
   flutter_gemma
+  flutter_timezone
+  flutter_tts
   record_windows
   rive_native
   speech_to_text_windows
 )
 
 list(APPEND FLUTTER_FFI_PLUGIN_LIST
+  flutter_local_notifications_windows
   jni
 )
 
