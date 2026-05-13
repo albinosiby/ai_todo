@@ -8,63 +8,80 @@ class GeminiService {
   final String _apiKey = AppConstants.geminiApiKey;
   static const String _logTag = 'GeminiService';
   static const List<String> _candidateModels = <String>[
-    'gemini-3-flash',
-    'gemini-3.1-flash',
+    'gemini-1.5-flash',
+    'gemini-1.5-pro',
     'gemini-2.5-flash',
-    'gemini-2.5-flash-lite',
-    'gemini-2.5-pro',
     'gemini-2.0-flash',
+    'gemini-3.1-pro',
+    'gemini-3-flash',
   ];
-  static const String _baseUrl = 'https://generativelanguage.googleapis.com/v1';
+  static const String _baseUrl = 'https://generativelanguage.googleapis.com/v1beta';
 
   GeminiService();
 
-  /// Asks clarifying questions about a potential task
-  Future<String> getClarifyingQuestions(String userTranscript) async {
-    final prompt = '''
-    Context: You are a productive task coach. A user just said: "$userTranscript".
-    Task: If this is a task or goal, ask 1-2 smart, concise clarifying questions to help make it specific and actionable.
-    Tone: Encouraging, professional, and coach-like.
-    Keep it very brief (under 30 words).
-    ''';
-
+  /// Chat conversation taking full history into account
+  Future<String> getChatResponse(List<Map<String, String>> history) async {
     final stopwatch = Stopwatch()..start();
     developer.log(
-      'getClarifyingQuestions started (input len=${userTranscript.length})',
+      'getChatResponse started (history len=${history.length})',
       name: _logTag,
     );
-    final responseText = await _generateTextWithFallback(
-      prompt: prompt,
-      timeout: const Duration(seconds: 20),
-      operationName: 'getClarifyingQuestions',
-    );
-    stopwatch.stop();
-    developer.log(
-      'getClarifyingQuestions success in ${stopwatch.elapsedMilliseconds}ms '
-      '(response len=${responseText.length})',
-      name: _logTag,
-    );
-    return responseText.isNotEmpty
-        ? responseText
-        : 'That sounds interesting. Can you tell me more about what you want to achieve?';
+    
+    final systemInstruction = '''
+You are a friendly, helpful, and strategic AI assistant.
+You can engage in normal, everyday conversation. 
+However, you are also an expert productivity coach. If the user mentions wanting to learn something, start a project, or create a plan, help them clarify their goal by asking 1-2 thoughtful questions to understand their deadline or scope.
+Tone: Conversational, warm, and professional.
+Keep responses concise and natural for voice interaction.
+''';
+
+    try {
+      final responseText = await _generateTextWithFallback(
+        history: history,
+        systemInstruction: systemInstruction,
+        timeout: const Duration(seconds: 20),
+        operationName: 'getChatResponse',
+        expectJsonResponse: false,
+      );
+      stopwatch.stop();
+      return responseText.isNotEmpty
+          ? responseText
+          : 'I am here to help. What is on your mind?';
+    } catch (e, s) {
+      stopwatch.stop();
+      developer.log('getChatResponse failed', name: _logTag, error: e, stackTrace: s);
+      return 'I am having trouble processing that. Can we try again?';
+    }
+  }
+
+  /// Kept for backwards compatibility if needed, but getChatResponse is preferred
+  Future<String> getClarifyingQuestions(String userTranscript) async {
+    return getChatResponse([{'role': 'user', 'text': userTranscript}]);
   }
 
   /// Decomposes a task into actionable sub-tasks
   Future<Task> decomposeTask(String taskTitle) async {
-    final prompt = '''
-    Context: You are a productive task coach.
-    Task: Decompose "$taskTitle" into 3-5 smart, actionable sub-tasks.
-    Format: Return ONLY a JSON object with the following structure:
+    final prompt =
+        '''
+    Context: You are a Strategic Productivity Engine.
+    Task: Decompose the goal "$taskTitle" into a high-level strategic plan.
+
+    Rules for SMART Sub-tasks:
+    - NEVER provide generic steps like "Read notes" or "Start working."
+    - ALWAYS provide actionable, high-impact steps. (e.g., "Set up a distraction-free environment and gather 3 core resources" or "Conduct a 20-minute active recall session on the first 2 chapters").
+    - For GOALS: Focus on the 80/20 rule (identify the 20% of work that gives 80% of results).
+    - For RECURRING: Include a "trigger" step (e.g., "Place the item next to your car keys as a visual cue").
+
+    Format: Return ONLY a JSON object:
     {
-      "title": "Main task title",
-      "description": "Short encouraging description",
+      "title": "Strategy: $taskTitle",
+      "description": "A focused roadmap to achieve this goal.",
       "subTasks": [
-        {"title": "Subtask 1"},
-        {"title": "Subtask 2"}
+        {"title": "Actionable Strategic Step 1"},
+        {"title": "Actionable Strategic Step 2"}
       ]
     }
-    No markdown formatting, no extra text.
-    ''';
+  ''';
 
     final stopwatch = Stopwatch()..start();
     developer.log(
@@ -76,6 +93,7 @@ class GeminiService {
         prompt: prompt,
         timeout: const Duration(seconds: 25),
         operationName: 'decomposeTask',
+        expectJsonResponse: true,
       );
       final data = jsonDecode(_extractJsonObject(responseText));
       final task = Task(
@@ -84,10 +102,12 @@ class GeminiService {
         description: data['description'] ?? '',
         createdAt: DateTime.now(),
         subTasks: (data['subTasks'] as List? ?? [])
-            .map((s) => SubTask(
-                  id: (DateTime.now().millisecondsSinceEpoch + 1).toString(),
-                  title: s['title'] ?? '',
-                ))
+            .map(
+              (s) => SubTask(
+                id: (DateTime.now().millisecondsSinceEpoch + 1).toString(),
+                title: s['title'] ?? '',
+              ),
+            )
             .toList(),
       );
       stopwatch.stop();
@@ -121,9 +141,12 @@ class GeminiService {
   }
 
   Future<String> _generateTextWithFallback({
-    required String prompt,
+    String? prompt,
+    List<Map<String, String>>? history,
+    String? systemInstruction,
     required Duration timeout,
     required String operationName,
+    required bool expectJsonResponse,
   }) async {
     Object? lastError;
     StackTrace? lastStackTrace;
@@ -137,7 +160,10 @@ class GeminiService {
         final response = await _callGenerateContent(
           modelName: modelName,
           prompt: prompt,
+          history: history,
+          systemInstruction: systemInstruction,
           timeout: timeout,
+          expectJsonResponse: expectJsonResponse,
         );
         developer.log(
           '$operationName succeeded with model "$modelName"',
@@ -164,38 +190,97 @@ class GeminiService {
 
   Future<String> _callGenerateContent({
     required String modelName,
-    required String prompt,
+    String? prompt,
+    List<Map<String, String>>? history,
+    String? systemInstruction,
     required Duration timeout,
+    required bool expectJsonResponse,
   }) async {
     final client = HttpClient()..connectionTimeout = timeout;
     try {
       final uri = Uri.parse(
         '$_baseUrl/models/$modelName:generateContent?key=$_apiKey',
       );
-      final request = await client.postUrl(uri).timeout(timeout);
-      request.headers.contentType = ContentType.json;
-      request.add(utf8.encode(jsonEncode({
-        'contents': [
-          {
-            'parts': [
-              {'text': prompt}
-            ]
+      
+      final List<Map<String, dynamic>> contents = [];
+      
+      if (history != null && history.isNotEmpty) {
+        contents.addAll(history.map((msg) => {
+          'role': msg['role'],
+          'parts': [{'text': _sanitizePrompt(msg['text'] ?? '')}],
+        }));
+      } else if (prompt != null) {
+        contents.add({
+          'role': 'user',
+          'parts': [{'text': _sanitizePrompt(prompt)}],
+        });
+      }
+
+      final requestPayload = <String, dynamic>{
+        'contents': contents,
+      };
+
+      if (systemInstruction != null) {
+        requestPayload['systemInstruction'] = {
+          'parts': [{'text': _sanitizePrompt(systemInstruction)}]
+        };
+      }
+
+      if (expectJsonResponse) {
+        requestPayload['generationConfig'] = {
+          'responseMimeType': 'application/json',
+        };
+      }
+
+      Future<Map<String, dynamic>> send(Map<String, dynamic> payload) async {
+        final request = await client.postUrl(uri).timeout(timeout);
+        request.headers.contentType = ContentType.json;
+        request.add(utf8.encode(jsonEncode(payload)));
+        final httpResponse = await request.close().timeout(timeout);
+        final body = await utf8.decodeStream(httpResponse).timeout(timeout);
+        final Map<String, dynamic> decoded = jsonDecode(body);
+        return {
+          'statusCode': httpResponse.statusCode,
+          'decoded': decoded,
+        };
+      }
+
+      var result = await send(requestPayload);
+      var statusCode = result['statusCode'] as int;
+      var decoded = result['decoded'] as Map<String, dynamic>;
+
+      if (statusCode < 200 || statusCode >= 300) {
+        final errorMsg =
+            (decoded['error']?['message'] as String?) ??
+            'HTTP $statusCode';
+
+        if (expectJsonResponse &&
+            errorMsg.toLowerCase().contains('invalid json payload')) {
+          final retryPayload = <String, dynamic>{
+            'contents': requestPayload['contents'],
+          };
+          if (requestPayload.containsKey('systemInstruction')) {
+             retryPayload['systemInstruction'] = requestPayload['systemInstruction'];
           }
-        ],
-      })));
+          result = await send(retryPayload);
+          statusCode = result['statusCode'] as int;
+          decoded = result['decoded'] as Map<String, dynamic>;
+          if (statusCode >= 200 && statusCode < 300) {
+            final retryText =
+                decoded['candidates']?[0]?['content']?['parts']?[0]?['text']
+                    as String?;
+            if (retryText != null && retryText.trim().isNotEmpty) {
+              return retryText;
+            }
+          }
+        }
 
-      final httpResponse = await request.close().timeout(timeout);
-      final body = await utf8.decodeStream(httpResponse).timeout(timeout);
-      final Map<String, dynamic> decoded = jsonDecode(body);
-
-      if (httpResponse.statusCode < 200 || httpResponse.statusCode >= 300) {
-        final errorMsg = (decoded['error']?['message'] as String?) ??
-            'HTTP ${httpResponse.statusCode}';
         throw StateError(errorMsg);
       }
 
-      final text = decoded['candidates']?[0]?['content']?['parts']?[0]?['text']
-          as String?;
+      final text =
+          decoded['candidates']?[0]?['content']?['parts']?[0]?['text']
+              as String?;
       if (text == null || text.trim().isEmpty) {
         throw StateError('Empty Gemini response text');
       }
@@ -203,6 +288,12 @@ class GeminiService {
     } finally {
       client.close(force: true);
     }
+  }
+
+  String _sanitizePrompt(String input) {
+    return input
+        .replaceAll(RegExp(r'[\u0000-\u0008\u000B\u000C\u000E-\u001F]'), ' ')
+        .trim();
   }
 
   String _extractJsonObject(String rawText) {

@@ -34,6 +34,9 @@ class VoiceCoachState extends Equatable {
   final Task? currentTask;
   final bool awaitingTaskConfirmation;
   final String pendingTaskContext;
+  final bool awaitingPlanApproval;
+  final Task? pendingDraftTask;
+  final List<Map<String, String>> chatHistory;
 
   const VoiceCoachState({
     this.status = VoiceCoachStatus.initial,
@@ -42,6 +45,9 @@ class VoiceCoachState extends Equatable {
     this.currentTask,
     this.awaitingTaskConfirmation = false,
     this.pendingTaskContext = '',
+    this.awaitingPlanApproval = false,
+    this.pendingDraftTask,
+    this.chatHistory = const [],
   });
 
   VoiceCoachState copyWith({
@@ -51,6 +57,10 @@ class VoiceCoachState extends Equatable {
     Task? currentTask,
     bool? awaitingTaskConfirmation,
     String? pendingTaskContext,
+    bool? awaitingPlanApproval,
+    Task? pendingDraftTask,
+    List<Map<String, String>>? chatHistory,
+    bool clearPendingDraftTask = false,
   }) {
     return VoiceCoachState(
       status: status ?? this.status,
@@ -60,6 +70,10 @@ class VoiceCoachState extends Equatable {
       awaitingTaskConfirmation:
           awaitingTaskConfirmation ?? this.awaitingTaskConfirmation,
       pendingTaskContext: pendingTaskContext ?? this.pendingTaskContext,
+      awaitingPlanApproval: awaitingPlanApproval ?? this.awaitingPlanApproval,
+      pendingDraftTask:
+          clearPendingDraftTask ? null : pendingDraftTask ?? this.pendingDraftTask,
+      chatHistory: chatHistory ?? this.chatHistory,
     );
   }
 
@@ -71,6 +85,9 @@ class VoiceCoachState extends Equatable {
         currentTask,
         awaitingTaskConfirmation,
         pendingTaskContext,
+        awaitingPlanApproval,
+        pendingDraftTask,
+        chatHistory,
       ];
 }
 
@@ -104,15 +121,9 @@ class VoiceCoachBloc extends Bloc<VoiceCoachEvent, VoiceCoachState> {
     _activeRequestId++;
     await _voiceService.stopListening();
     await _voiceService.stopSpeaking();
-    emit(state.copyWith(status: VoiceCoachStatus.listening));
+    emit(state.copyWith(status: VoiceCoachStatus.listening, lastSpeech: ''));
     await _voiceService.listen(
-      onResult: (speech) {
-        developer.log(
-          'Speech result received (len=${speech.length}): "$speech"',
-          name: _logTag,
-        );
-        add(ProcessUserSpeechEvent(speech));
-      },
+      onResult: (_) {},
       onListeningChanged: (isListening) {
         developer.log('Listening changed: $isListening', name: _logTag);
         if (!isListening && state.status == VoiceCoachStatus.listening) {
@@ -124,7 +135,8 @@ class VoiceCoachBloc extends Bloc<VoiceCoachEvent, VoiceCoachState> {
 
   Future<void> _onStopListening(StopListeningEvent event, Emitter<VoiceCoachState> emit) async {
     developer.log('StopListeningEvent received', name: _logTag);
-    await _voiceService.stopListening();
+    final words = await _voiceService.stopListening();
+    add(ProcessUserSpeechEvent(words));
   }
 
   Future<void> _onInterruptInteraction(
@@ -133,12 +145,14 @@ class VoiceCoachBloc extends Bloc<VoiceCoachEvent, VoiceCoachState> {
   ) async {
     developer.log('InterruptInteractionEvent received', name: _logTag);
     _activeRequestId++;
-    await _voiceService.stopListening();
+    await _voiceService.cancelListening();
     await _voiceService.stopSpeaking();
     emit(state.copyWith(
       status: VoiceCoachStatus.initial,
       awaitingTaskConfirmation: false,
       pendingTaskContext: '',
+      awaitingPlanApproval: false,
+      clearPendingDraftTask: true,
     ));
   }
 
@@ -163,47 +177,120 @@ class VoiceCoachBloc extends Bloc<VoiceCoachEvent, VoiceCoachState> {
       name: _logTag,
     );
     await _voiceService.stopListening();
-    emit(state.copyWith(status: VoiceCoachStatus.processing, lastSpeech: speech));
+    
+    final updatedHistory = List<Map<String, String>>.from(state.chatHistory)
+      ..add({'role': 'user', 'text': speech});
+
+    emit(state.copyWith(
+      status: VoiceCoachStatus.processing, 
+      lastSpeech: speech,
+      chatHistory: updatedHistory,
+    ));
     try {
       if (state.awaitingTaskConfirmation) {
+        if (state.awaitingPlanApproval && state.pendingDraftTask != null) {
+          if (_isPlanApproval(speech)) {
+            await _persistDraftTask(
+              requestId: requestId,
+              draftTask: state.pendingDraftTask!,
+              emit: emit,
+            );
+            return;
+          }
+
+          // User continued conversation instead of approving the preview.
+          final mergedContext = state.pendingTaskContext.isEmpty
+              ? speech
+              : '${state.pendingTaskContext}\n$speech';
+          final followUpResponse = await _buildClarifyingResponse(
+            requestId: requestId,
+            speech: mergedContext,
+          );
+          if (requestId != _activeRequestId) return;
+          emit(state.copyWith(
+            status: VoiceCoachStatus.speaking,
+            coachResponse:
+                '$followUpResponse\n\nWhen ready, say: "create this task".',
+            awaitingTaskConfirmation: true,
+            pendingTaskContext: mergedContext,
+            awaitingPlanApproval: false,
+            clearPendingDraftTask: true,
+          ));
+          await _voiceService.speak(
+            '$followUpResponse. When ready, say create this task.',
+          );
+          add(StartListeningEvent());
+          return;
+        }
+
         if (_isTaskCreationConfirmation(speech)) {
           final mergedPrompt = state.pendingTaskContext.isEmpty
               ? speech
               : '${state.pendingTaskContext}\n$speech';
-          await _createAndPersistTask(
+          final draftTask = await _buildDraftTask(
             requestId: requestId,
             prompt: mergedPrompt,
-            emit: emit,
           );
+          if (requestId != _activeRequestId) return;
+          final planPreview = _summarizePlan(draftTask);
+          emit(state.copyWith(
+            status: VoiceCoachStatus.speaking,
+            coachResponse:
+                '$planPreview\n\nIf this looks good, say: "approve plan".',
+            awaitingTaskConfirmation: true,
+            awaitingPlanApproval: true,
+            pendingTaskContext: mergedPrompt,
+            pendingDraftTask: draftTask,
+          ));
+          await _voiceService.speak(
+            'I created a draft action plan. If it looks good, say approve plan.',
+          );
+          add(StartListeningEvent());
           return;
         }
 
         final mergedContext = state.pendingTaskContext.isEmpty
             ? speech
             : '${state.pendingTaskContext}\n$speech';
-        final followUpResponse = await _buildClarifyingResponse(
-          requestId: requestId,
-          speech: mergedContext,
-        );
+            
+        final contextHistory = List<Map<String, String>>.from(state.chatHistory)
+          ..add({'role': 'user', 'text': 'I need to plan this: $mergedContext'});
+          
+        final followUpResponse = await _geminiService.getChatResponse(contextHistory);
+        
         if (requestId != _activeRequestId) return;
+        
+        final newHistory = List<Map<String, String>>.from(updatedHistory)
+          ..add({'role': 'model', 'text': followUpResponse});
         emit(state.copyWith(
           status: VoiceCoachStatus.speaking,
           coachResponse:
               '$followUpResponse\n\nWhen ready, say: "create this task".',
           awaitingTaskConfirmation: true,
           pendingTaskContext: mergedContext,
+          awaitingPlanApproval: false,
+          clearPendingDraftTask: true,
+          chatHistory: newHistory,
         ));
         await _voiceService.speak(
           '$followUpResponse. When ready, say create this task.',
         );
-        emit(state.copyWith(status: VoiceCoachStatus.initial));
+        add(StartListeningEvent());
         return;
       }
 
-      final response = await _buildClarifyingResponse(
-        requestId: requestId,
-        speech: speech,
-      );
+      if (_shouldCreateTask(speech) && _isSimpleTaskIntent(speech)) {
+        await _createSimpleReminderTask(
+          requestId: requestId,
+          speech: speech,
+          updatedHistory: updatedHistory,
+          emit: emit,
+        );
+        return;
+      }
+
+      final response = await _geminiService.getChatResponse(updatedHistory);
+      
       if (requestId != _activeRequestId) {
         developer.log(
           'Ignoring stale clarifying response for requestId=$requestId '
@@ -217,7 +304,14 @@ class VoiceCoachBloc extends Bloc<VoiceCoachEvent, VoiceCoachState> {
         name: _logTag,
       );
 
-      emit(state.copyWith(status: VoiceCoachStatus.speaking, coachResponse: response));
+      final newHistory = List<Map<String, String>>.from(updatedHistory)
+        ..add({'role': 'model', 'text': response});
+
+      emit(state.copyWith(
+        status: VoiceCoachStatus.speaking, 
+        coachResponse: response,
+        chatHistory: newHistory,
+      ));
       await _voiceService.speak(response);
       if (requestId != _activeRequestId) {
         developer.log(
@@ -230,25 +324,25 @@ class VoiceCoachBloc extends Bloc<VoiceCoachEvent, VoiceCoachState> {
 
       if (_shouldCreateTask(speech)) {
         developer.log(
-          'Task intent detected; waiting for confirmation requestId=$requestId',
+          'Complex task intent detected; waiting for details requestId=$requestId',
           name: _logTag,
         );
         emit(state.copyWith(
-          status: VoiceCoachStatus.initial,
+          status: VoiceCoachStatus.speaking, // Keeping speaking status as StartListening will switch to listening immediately
           awaitingTaskConfirmation: true,
           pendingTaskContext: speech,
-          coachResponse: '$response\n\nWhen ready, say: "create this task".',
+          coachResponse:
+              '$response\n\nI will draft a plan after your details. Then I will ask for approval.',
+          awaitingPlanApproval: false,
+          clearPendingDraftTask: true,
         ));
+        add(StartListeningEvent());
       } else {
         developer.log(
-          'No task trigger for requestId=$requestId, returning to initial',
+          'No task trigger for requestId=$requestId, auto-resuming listening',
           name: _logTag,
         );
-        emit(state.copyWith(
-          status: VoiceCoachStatus.initial,
-          awaitingTaskConfirmation: false,
-          pendingTaskContext: '',
-        ));
+        add(StartListeningEvent());
       }
     } catch (e, s) {
       if (requestId != _activeRequestId) {
@@ -273,6 +367,8 @@ class VoiceCoachBloc extends Bloc<VoiceCoachEvent, VoiceCoachState> {
         coachResponse: failureText,
         awaitingTaskConfirmation: false,
         pendingTaskContext: '',
+        awaitingPlanApproval: false,
+        clearPendingDraftTask: true,
       ));
       await _voiceService.speak(failureText);
     }
@@ -292,6 +388,11 @@ class VoiceCoachBloc extends Bloc<VoiceCoachEvent, VoiceCoachState> {
       'create a task',
       'new task',
       'add task',
+      'learn',
+      'study',
+      'teach me',
+      'i have to learn',
+      'i want to learn',
       'remind me to',
       'notify me to',
       'break down',
@@ -305,8 +406,95 @@ class VoiceCoachBloc extends Bloc<VoiceCoachEvent, VoiceCoachState> {
     return triggerPhrases.any(normalized.contains);
   }
 
+  bool _isSimpleTaskIntent(String speech) {
+    final normalized = speech.toLowerCase();
+    final hasComplexKeywords = normalized.contains('learn') ||
+        normalized.contains('study') ||
+        normalized.contains('project') ||
+        normalized.contains('goal') ||
+        normalized.contains('roadmap') ||
+        normalized.contains('plan for') ||
+        normalized.contains('strategy') ||
+        normalized.contains('break down') ||
+        normalized.contains('decompose');
+    if (hasComplexKeywords) return false;
+
+    final hasReminderCue = normalized.contains('remind me') ||
+        normalized.contains('notify me') ||
+        normalized.contains('remember to');
+    if (hasReminderCue) {
+      // "and 2 o'clock" is usually time detail, not a second task.
+      return true;
+    }
+
+    final hasMultipleActions =
+        normalized.contains(',') || normalized.contains(' and ');
+    if (hasMultipleActions) return false;
+
+    // Short one-action instructions are treated as simple reminders.
+    final words = normalized.split(RegExp(r'\s+')).where((w) => w.isNotEmpty).length;
+    return words <= 10;
+  }
+
   DateTime? _extractReminderTime(String speech) {
     final normalized = speech.toLowerCase();
+    final now = DateTime.now();
+
+    // Parse explicit clock time even without "remind me".
+    final timeMatch = RegExp(
+      r'\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm|o''clock|oclock)?\b',
+    ).firstMatch(normalized);
+    if (timeMatch != null) {
+      var hour = int.tryParse(timeMatch.group(1) ?? '');
+      final minute = int.tryParse(timeMatch.group(2) ?? '') ?? 0;
+      final meridiem = timeMatch.group(3);
+      if (hour != null) {
+        if (meridiem == 'pm' && hour < 12) hour += 12;
+        if (meridiem == 'am' && hour == 12) hour = 0;
+        if ((meridiem == 'o''clock' || meridiem == 'oclock') && hour <= 12) {
+          // Keep as spoken hour in 24h style; if already passed, schedule tomorrow.
+        }
+        var scheduled = DateTime(now.year, now.month, now.day, hour, minute);
+        if (scheduled.isBefore(now)) {
+          scheduled = scheduled.add(const Duration(days: 1));
+        }
+        return scheduled;
+      }
+    }
+
+    // Parse word-based clock times like "two o'clock", "six pm".
+    final wordTimeMatch = RegExp(
+      r'\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b(?:\s*o''clock|\s*(am|pm))?',
+    ).firstMatch(normalized);
+    if (wordTimeMatch != null) {
+      final word = wordTimeMatch.group(1) ?? '';
+      final meridiem = wordTimeMatch.group(2);
+      final wordToHour = <String, int>{
+        'one': 1,
+        'two': 2,
+        'three': 3,
+        'four': 4,
+        'five': 5,
+        'six': 6,
+        'seven': 7,
+        'eight': 8,
+        'nine': 9,
+        'ten': 10,
+        'eleven': 11,
+        'twelve': 12,
+      };
+      var hour = wordToHour[word];
+      if (hour != null) {
+        if (meridiem == 'pm' && hour < 12) hour += 12;
+        if (meridiem == 'am' && hour == 12) hour = 0;
+        var scheduled = DateTime(now.year, now.month, now.day, hour);
+        if (scheduled.isBefore(now)) {
+          scheduled = scheduled.add(const Duration(days: 1));
+        }
+        return scheduled;
+      }
+    }
+
     final asksReminder = normalized.contains('remind') ||
         normalized.contains('notify') ||
         normalized.contains('notification') ||
@@ -315,8 +503,6 @@ class VoiceCoachBloc extends Bloc<VoiceCoachEvent, VoiceCoachState> {
     if (!asksReminder) {
       return null;
     }
-
-    final now = DateTime.now();
     final minuteMatch =
         RegExp(r'in\s+(\d+)\s*(minute|minutes|min|mins)\b').firstMatch(normalized);
     if (minuteMatch != null) {
@@ -372,6 +558,25 @@ class VoiceCoachBloc extends Bloc<VoiceCoachEvent, VoiceCoachState> {
     return confirmations.any(normalized.contains);
   }
 
+  bool _isPlanApproval(String speech) {
+    final normalized = speech.toLowerCase();
+    const approvals = <String>[
+      'approve',
+      'approved',
+      'yes',
+      'looks good',
+      'okay',
+      'ok',
+      'confirm',
+      'save',
+      'perfect',
+      'sure',
+      'go ahead',
+    ];
+    return approvals.any(normalized.contains);
+  }
+
+  // Kept for backwards compatibility if needed elsewhere
   Future<String> _buildClarifyingResponse({
     required int requestId,
     required String speech,
@@ -392,10 +597,9 @@ class VoiceCoachBloc extends Bloc<VoiceCoachEvent, VoiceCoachState> {
     }
   }
 
-  Future<void> _createAndPersistTask({
+  Future<Task> _buildDraftTask({
     required int requestId,
     required String prompt,
-    required Emitter<VoiceCoachState> emit,
   }) async {
     final reminderTime = _extractReminderTime(prompt);
     final task = (await _geminiService.decomposeTask(prompt)).copyWith(
@@ -403,6 +607,48 @@ class VoiceCoachBloc extends Bloc<VoiceCoachEvent, VoiceCoachState> {
       reminderAt: reminderTime,
       clearReminderAt: reminderTime == null,
     );
+    if (requestId != _activeRequestId) {
+      developer.log(
+        'Ignoring stale draft decomposition for requestId=$requestId '
+        '(active=$_activeRequestId)',
+        name: _logTag,
+      );
+    }
+    return task;
+  }
+
+  String _summarizePlan(Task draftTask) {
+    final buffer = StringBuffer()
+      ..writeln('Draft action plan for: ${draftTask.title}')
+      ..writeln(draftTask.description.isEmpty
+          ? 'Description: Let us execute this step by step.'
+          : 'Description: ${draftTask.description}');
+    if (draftTask.subTasks.isNotEmpty) {
+      final phaseSize = draftTask.subTasks.length >= 20 ? 6 : 4;
+      final phaseCount = (draftTask.subTasks.length / phaseSize).ceil();
+      for (int phase = 0; phase < phaseCount; phase++) {
+        final start = phase * phaseSize;
+        final endExclusive = (start + phaseSize) > draftTask.subTasks.length
+            ? draftTask.subTasks.length
+            : (start + phaseSize);
+        buffer.writeln('Phase ${phase + 1}:');
+        for (int i = start; i < endExclusive; i++) {
+          buffer.writeln('- ${draftTask.subTasks[i].title}');
+        }
+      }
+    } else {
+      buffer.writeln('Steps:\n1. Start with the first concrete action now.');
+    }
+    return buffer.toString().trim();
+  }
+
+  Future<void> _persistDraftTask({
+    required int requestId,
+    required Task draftTask,
+    required Emitter<VoiceCoachState> emit,
+  }) async {
+    final reminderTime = draftTask.reminderAt;
+    final task = draftTask;
     if (requestId != _activeRequestId) {
       developer.log(
         'Ignoring stale decomposition for requestId=$requestId (active=$_activeRequestId)',
@@ -428,7 +674,12 @@ class VoiceCoachBloc extends Bloc<VoiceCoachEvent, VoiceCoachState> {
       currentTask: task,
       awaitingTaskConfirmation: false,
       pendingTaskContext: '',
+      awaitingPlanApproval: false,
+      clearPendingDraftTask: true,
     ));
+
+    await _voiceService.speak('Awesome! The task and its sub-tasks have been saved to your list.');
+    add(StartListeningEvent());
 
     if (reminderTime != null) {
       final nextStep = _nextStepFor(task);
@@ -449,5 +700,69 @@ class VoiceCoachBloc extends Bloc<VoiceCoachEvent, VoiceCoachState> {
         name: _logTag,
       );
     }
+  }
+
+  Future<void> _createSimpleReminderTask({
+    required int requestId,
+    required String speech,
+    required List<Map<String, String>> updatedHistory,
+    required Emitter<VoiceCoachState> emit,
+  }) async {
+    final reminderTime = _extractReminderTime(speech) ??
+        DateTime.now().add(const Duration(hours: 1));
+    final title = _buildSimpleTitle(speech);
+    final task = Task(
+      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      title: title,
+      description: 'Quick reminder created from your request.',
+      createdAt: DateTime.now(),
+      reminderAt: reminderTime,
+      sourcePrompt: speech,
+      subTasks: const [
+        SubTask(id: '1', title: 'Complete this task'),
+      ],
+    );
+
+    if (requestId != _activeRequestId) return;
+    await _taskService.saveTask(task);
+    if (requestId != _activeRequestId) return;
+
+    await _notificationService.scheduleTaskReminder(
+      id: task.id.hashCode.abs() % 100000,
+      title: 'Reminder: ${task.title}',
+      body: 'Friendly nudge: this is your simple task reminder.',
+      scheduledTime: reminderTime,
+    );
+
+    final successResponse = 'Got it. This is a simple task, so I set a reminder for you. If you want, I can make a detailed plan too.';
+    
+    final newHistory = List<Map<String, String>>.from(updatedHistory)
+        ..add({'role': 'model', 'text': successResponse});
+
+    emit(state.copyWith(
+      status: VoiceCoachStatus.success,
+      currentTask: task,
+      coachResponse: successResponse,
+      awaitingTaskConfirmation: false,
+      pendingTaskContext: '',
+      awaitingPlanApproval: false,
+      clearPendingDraftTask: true,
+      chatHistory: newHistory,
+    ));
+    await _voiceService.speak(
+      'Done. I set a reminder for this simple task.',
+    );
+    add(StartListeningEvent());
+  }
+
+  String _buildSimpleTitle(String speech) {
+    var title = speech;
+    title = title.replaceAll(
+      RegExp(r'\b(remind me to|notify me to|please|can you|will you)\b', caseSensitive: false),
+      '',
+    );
+    title = title.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (title.isEmpty) return 'Simple reminder';
+    return '${title[0].toUpperCase()}${title.substring(1)}';
   }
 }

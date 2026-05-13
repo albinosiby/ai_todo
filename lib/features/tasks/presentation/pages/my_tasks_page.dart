@@ -1,3 +1,4 @@
+import 'dart:developer' as developer;
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:intl/intl.dart';
@@ -23,6 +24,17 @@ class MyTasksPage extends StatelessWidget {
       body: StreamBuilder<List<Task>>(
         stream: taskService.getTasks(),
         builder: (context, snapshot) {
+          if (snapshot.hasError) {
+            developer.log('Error fetching tasks: ${snapshot.error}');
+            return Center(
+              child: Text(
+                'Error loading tasks:\n${snapshot.error}',
+                style: const TextStyle(color: Colors.red),
+                textAlign: TextAlign.center,
+              ),
+            );
+          }
+
           if (snapshot.connectionState == ConnectionState.waiting) {
             return const Center(child: CircularProgressIndicator());
           }
@@ -217,32 +229,7 @@ class TaskDetailPage extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 8),
-              ...task.subTasks.asMap().entries.map((entry) {
-                final index = entry.key;
-                final subTask = entry.value;
-                return CheckboxListTile(
-                  value: subTask.isCompleted,
-                  activeColor: Colors.indigoAccent,
-                  title: Text(
-                    subTask.title,
-                    style: GoogleFonts.outfit(color: Colors.white),
-                  ),
-                  onChanged: (value) async {
-                    final updatedSubTasks = [...task.subTasks];
-                    updatedSubTasks[index] = subTask.copyWith(
-                      isCompleted: value ?? false,
-                    );
-                    final allDone = updatedSubTasks.isNotEmpty &&
-                        updatedSubTasks.every((item) => item.isCompleted);
-                    final updatedTask = task.copyWith(
-                      subTasks: updatedSubTasks,
-                      isCompleted: allDone,
-                    );
-                    await taskService.updateTask(updatedTask);
-                  },
-                  controlAffinity: ListTileControlAffinity.leading,
-                );
-              }),
+              ..._buildPhaseSections(task, taskService),
             ],
           );
         },
@@ -265,5 +252,62 @@ class TaskDetailPage extends StatelessWidget {
       }
     }
     return null;
+  }
+
+  List<Widget> _buildPhaseSections(Task task, TaskService taskService) {
+    if (task.subTasks.isEmpty) return const [];
+    final phaseSize = task.subTasks.length >= 20 ? 6 : 4;
+    final totalPhases = (task.subTasks.length / phaseSize).ceil();
+    final widgets = <Widget>[];
+
+    for (int phase = 0; phase < totalPhases; phase++) {
+      final start = phase * phaseSize;
+      final endExclusive = (start + phaseSize) > task.subTasks.length
+          ? task.subTasks.length
+          : (start + phaseSize);
+
+      widgets.add(
+        Padding(
+          padding: const EdgeInsets.only(top: 8.0, bottom: 4),
+          child: Text(
+            'Phase ${phase + 1}',
+            style: GoogleFonts.outfit(
+              color: Colors.indigoAccent,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
+      );
+
+      for (int i = start; i < endExclusive; i++) {
+        final subTask = task.subTasks[i];
+        widgets.add(
+          CheckboxListTile(
+            value: subTask.isCompleted,
+            activeColor: Colors.indigoAccent,
+            title: Text(
+              subTask.title,
+              style: GoogleFonts.outfit(color: Colors.white),
+            ),
+            onChanged: (value) async {
+              final updatedSubTasks = [...task.subTasks];
+              updatedSubTasks[i] = subTask.copyWith(
+                isCompleted: value ?? false,
+              );
+              final allDone = updatedSubTasks.isNotEmpty &&
+                  updatedSubTasks.every((item) => item.isCompleted);
+              final updatedTask = task.copyWith(
+                subTasks: updatedSubTasks,
+                isCompleted: allDone,
+              );
+              await taskService.updateTask(updatedTask);
+            },
+            controlAffinity: ListTileControlAffinity.leading,
+          ),
+        );
+      }
+    }
+
+    return widgets;
   }
 }

@@ -177,6 +177,8 @@ class VoiceChatView extends StatelessWidget {
             onTap: () {
               if (isListening) {
                 context.read<VoiceCoachBloc>().add(StopListeningEvent());
+              } else if (isBusy) {
+                context.read<VoiceCoachBloc>().add(InterruptInteractionEvent());
               } else {
                 context.read<VoiceCoachBloc>().add(StartListeningEvent());
               }
